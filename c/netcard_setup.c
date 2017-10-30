@@ -4,13 +4,16 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <net/route.h>
 #include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <errno.h>
 
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 
-#define BUFSIZE 8192
-struct RouteInfo_t
+#define NET_NL_BUFSIZE 8192
+struct NetRouteInfo_t
 {
 	char    szIfName[IF_NAMESIZE];
 	u_int   unGateway;
@@ -19,12 +22,12 @@ struct RouteInfo_t
 };
 
 static int
-NLI_ReadNlSock(int nSock, char* pBuf, int nSeqNum, int nPld)
+NLI_ReadNlSock(int nSock, char* pBuf, int nSeqNum, int nPid)
 {
 	struct nlmsghdr* pNlHdr = NULL;
 	int nReadLen = 0, nMsgLen = 0;
 	while (1) {
-		if ((nReadLen = recv(nSock, pBuf, BUFSIZE - nMsgLen, 0)) < 0) {
+		if ((nReadLen = recv(nSock, pBuf, NET_NL_BUFSIZE - nMsgLen, 0)) < 0) {
 			printf("%s ****recv error!\n", __FUNCTION__);
 			return -1;
 		}
@@ -44,7 +47,7 @@ NLI_ReadNlSock(int nSock, char* pBuf, int nSeqNum, int nPld)
 			break ;
 		}
 		if (pNlHdr->nlmsg_seq != (unsigned int) nSeqNum
-			|| (pNlHdr->nlmsg_pid != (unsigned int) nPld)) {
+			|| (pNlHdr->nlmsg_pid != (unsigned int) nPid)) {
 			break ;
 		}
 	}
@@ -52,7 +55,7 @@ NLI_ReadNlSock(int nSock, char* pBuf, int nSeqNum, int nPld)
 }
 
 static int
-NLI_ParseRoute(struct nlmsghdr* pNlHdr, struct RouteInfo_t* pRtInfo, char* szDefaultGateway)
+NLI_ParseRoute(struct nlmsghdr* pNlHdr, struct NetRouteInfo_t* pRtInfo, char* pDefaultGateway)
 {
 	int nRtLen = 0;
 	struct in_addr tDst;
@@ -62,8 +65,7 @@ NLI_ParseRoute(struct nlmsghdr* pNlHdr, struct RouteInfo_t* pRtInfo, char* szDef
 	pRtMsg = (struct rtmsg*) NLMSG_DATA(pNlHdr);
 	if ((pRtMsg->rtm_family != AF_INET)
 		|| (pRtMsg->rtm_table != RT_TABLE_MAIN)) {
-		printf("%s ****rtm family: %d, rtm_table: %d error!\n",
-			__FUNCTION__, pRtMsg->rtm_family, pRtMsg->rtm_table);
+		//printf("%s ****rtm family: %d, rtm_table: %d error!\n", __FUNCTION__, pRtMsg->rtm_family, pRtMsg->rtm_table);
 		return -1;
 	}
 	pRtAttr = (struct rtattr*) RTM_RTA(pRtMsg);
@@ -87,22 +89,25 @@ NLI_ParseRoute(struct nlmsghdr* pNlHdr, struct RouteInfo_t* pRtInfo, char* szDef
 	tDst.s_addr = pRtInfo->unDstAddr;
 	if (strstr((char*)inet_ntoa(tDst), "0.0.0.0")) {
 		tGate.s_addr = pRtInfo->unGateway;
-		strcpy(szDefaultGateway, (char*) inet_ntoa(tGate));
+		strncpy(pDefaultGateway, (char*) inet_ntoa(tGate), 32);
 	}
 
 	return 0;
 }
 
+/*!
+ * @brief get default gateway by plNetDev
+ */
 int
-NL_GetDefaultGateway(const char* lpszEth, char* szDefaultGateway)
+NL_GetDefaultGateway(const char* lpNetDev, char* pDefaultGateway)
 {
-	static char szGatewayTmp[32] = {0};
-	static char szMsgBuf[BUFSIZE] = {0};
-	static struct RouteInfo_t tRi;
+	static char szGatewayTmp[16] = {0};
+	static char szMsgBuf[NET_NL_BUFSIZE] = {0};
+	static struct NetRouteInfo_t tRi;
 	int nRet = -1;
 	struct nlmsghdr* pNlMsg = NULL;
 	struct rtmsg* pRtMsg = NULL;
-	struct RouteInfo_t* pRtInfo = &tRi;
+	struct NetRouteInfo_t* pRtInfo = &tRi;
 	int nLen = 0, nMsgSeq = 0;
 	int nSock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
 	if (nSock < 0) {
@@ -130,12 +135,12 @@ NL_GetDefaultGateway(const char* lpszEth, char* szDefaultGateway)
 		for (; NLMSG_OK(pNlMsg, (unsigned int) nLen); pNlMsg = NLMSG_NEXT(pNlMsg, nLen))
 		{
 			memset(szGatewayTmp, 0, sizeof (szGatewayTmp));
-			memset(pRtInfo, 0, sizeof (struct RouteInfo_t));
+			memset(pRtInfo, 0, sizeof (struct NetRouteInfo_t));
 			if (0 == NLI_ParseRoute(pNlMsg, pRtInfo, szGatewayTmp)) {
-				if (strcmp(pRtInfo->szIfName, lpszEth) == 0
+				if (strcmp(pRtInfo->szIfName, lpNetDev) == 0
 					&& strcmp(szGatewayTmp, "0.0.0.0") != 0
 					&& strlen(szGatewayTmp) > 0) {
-					strcpy(szDefaultGateway, szGatewayTmp);
+					strncpy(pDefaultGateway, szGatewayTmp, 32);
 					nRet = 0;
 				}
 			}
@@ -150,13 +155,206 @@ END:
 	return nRet;
 }
 
-
-
-/*!
- * @brief get ip address, subnet mask and mac address
+/*
+ * @brief set default gateway
  */
 int
-NL_GetLocalNetInfo(const char* lpszEth, char* szIpAddr, char* szNetmask, char* szMacAddr)
+NL_SetDefaultGateway(const char* lpNetDev, const char* lpIpAddr, const char* lpGateway, const char* lpNetmask)
+{
+    int nRet = -1;
+    int nSock;
+    struct rtentry tRtEntry;
+    struct sockaddr_in* pAddr;
+    nSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (nSock < 0) {
+        printf("%s ****socket error\n", __FUNCTION__);
+        goto END;
+    }
+    memset(&tRtEntry, 0x0, sizeof (struct rtentry));
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = INADDR_ANY;
+    tRtEntry.rt_flags = RTF_UP | RTF_MODIFIED | RTF_GATEWAY;
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    // delete old default gateway
+    if (ioctl(nSock, SIOCDELRT, &tRtEntry) < 0) {
+        printf("%s ****ioctl SIOCDELRT error!\n", __FUNCTION__);
+        printf("%s ****errmsg: %s\n", __FUNCTION__, strerror(errno));
+        //goto END;
+    }
+    memset(&tRtEntry, 0x0, sizeof (struct rtentry));
+    tRtEntry.rt_flags = RTF_UP | RTF_MODIFIED;
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_genmask;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = inet_addr(lpNetmask);
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = inet_addr(lpIpAddr) & inet_addr(lpNetmask);
+    if (ioctl(nSock, SIOCDELRT, &tRtEntry) < 0) {
+        printf("%s ****ioctl SIOCDELRT 2 error!\n", __FUNCTION__);
+        //goto END;
+    }
+    memset(&tRtEntry, 0x0, sizeof (struct rtentry));
+    tRtEntry.rt_flags = RTF_UP | RTF_MODIFIED;
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_genmask;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = inet_addr(lpNetmask);
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = inet_addr(lpIpAddr) & inet_addr(lpNetmask);
+    tRtEntry.rt_metric = 0;
+    // accept this route
+    if (ioctl(nSock, SIOCADDRT, &tRtEntry) < 0) {
+        printf("%s ****ioctl SIOCADDRT error!\n", __FUNCTION__);
+        goto END;
+    }
+    memset(&tRtEntry, 0x0, sizeof (struct rtentry));
+    tRtEntry.rt_flags = RTF_UP | RTF_MODIFIED;
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    tRtEntry.rt_metric = 0;
+    // gateway
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_gateway;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = inet_addr(lpGateway);
+    pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+    pAddr->sin_family = AF_INET;
+    pAddr->sin_port = 0;
+    pAddr->sin_addr.s_addr = INADDR_ANY;
+    tRtEntry.rt_flags |= RTF_GATEWAY;
+    // accept this route
+    if (ioctl(nSock, SIOCADDRT, &tRtEntry) < 0) {
+        printf("%s ****ioctl SIOCADDRT 2 error!\n", __FUNCTION__);
+        goto END;
+    }
+    nRet = 0;
+
+END:
+    if (nSock > 0) {
+        close(nSock);
+        nSock = -1;
+    }
+    return nRet;
+}
+
+/*!
+ * @brief add route
+ */
+int NL_AddRoute(const char* lpNetDev, const char* lpRoute, const char* lpNetmask)
+{
+    if (!lpRoute) {
+        printf("%s ****error!\n", __FUNCTION__);
+        return -1;
+    }
+    int nRet = -1;
+    int nSock;
+    struct sockaddr_in* pAddr;
+    struct rtentry tRtEntry;
+
+    nSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (nSock < 0)
+    {
+        printf("%s ****socket error!\n", __FUNCTION__);
+        goto END;
+    }
+
+    memset(&tRtEntry, 0, sizeof(struct rtentry));
+    if (lpRoute) {
+        pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+        pAddr->sin_family = AF_INET;
+        pAddr->sin_port = 0;
+        pAddr->sin_addr.s_addr = inet_addr(lpRoute);
+    }
+    if (lpNetmask) {
+        pAddr = (struct sockaddr_in*) &tRtEntry.rt_genmask;
+        pAddr->sin_family = AF_INET;
+        pAddr->sin_port = 0;
+        pAddr->sin_addr.s_addr = inet_addr(lpNetmask);
+    }
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    tRtEntry.rt_flags = RTF_UP;
+    // add route
+    if (ioctl(nSock, SIOCADDRT, &tRtEntry) < 0)
+    {
+        printf("%s ****ioctl SIOCADDRT error!\n", __FUNCTION__);
+        printf("%s ****errmsg: %s\n", __FUNCTION__, strerror(errno));
+        goto END;
+    }
+    nRet = 0;
+
+END:
+    if (nSock < 0) {
+        close(nSock);
+        nSock = -1;
+    }
+    return nRet;
+}
+
+/*!
+ * @brief del route
+ */
+int NL_DelRoute(const char* lpNetDev, const char* lpRoute, const char* lpNetmask)
+{
+    if (!lpRoute) {
+        printf("%s ****error!\n", __FUNCTION__);
+        return -1;
+    }
+    int nRet = -1;
+    int nSock;
+    struct sockaddr_in* pAddr;
+    struct rtentry tRtEntry;
+
+    nSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (nSock < 0)
+    {
+        printf("%s ****socket error!\n", __FUNCTION__);
+        goto END;
+    }
+
+    memset(&tRtEntry, 0, sizeof(struct rtentry));
+    if (lpRoute) {
+        pAddr = (struct sockaddr_in*) &tRtEntry.rt_dst;
+        pAddr->sin_family = AF_INET;
+        pAddr->sin_port = 0;
+        pAddr->sin_addr.s_addr = inet_addr(lpRoute);
+    }
+    if (lpNetmask) {
+        pAddr = (struct sockaddr_in*) &tRtEntry.rt_genmask;
+        pAddr->sin_family = AF_INET;
+        pAddr->sin_port = 0;
+        pAddr->sin_addr.s_addr = inet_addr(lpNetmask);
+    }
+    tRtEntry.rt_dev = (char*) lpNetDev;
+    tRtEntry.rt_flags = RTF_UP;
+    // del route
+    if (ioctl(nSock, SIOCDELRT, &tRtEntry) < 0)
+    {
+        printf("%s ****ioctl SIOCDELRT error!\n", __FUNCTION__);
+        printf("%s ****error message: %s\n", __FUNCTION__, strerror(errno));
+        goto END;
+    }
+    nRet = 0;
+
+END:
+    if (nSock < 0) {
+        close(nSock);
+        nSock = -1;
+    }
+    return nRet;
+}
+
+/*!
+ * @brief get ip address, subnet mask and mac address by lpNetDev
+ */
+int
+NL_GetLocalNetInfo(const char* lpNetDev, char* pIpAddr, char* pNetmask, char* pMacAddr)
 {
 	int nRet = 0;
 	struct ifreq tReq;
@@ -168,28 +366,28 @@ NL_GetLocalNetInfo(const char* lpszEth, char* szIpAddr, char* szNetmask, char* s
 	}
 
 	bzero(&tReq, sizeof (struct ifreq));
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	if (ioctl(nSock, SIOCGIFADDR, &tReq) >= 0) {
 		pHost = (struct sockaddr_in*) &tReq.ifr_addr;
-		strcpy(szIpAddr, inet_ntoa(pHost->sin_addr));
+		strncpy(pIpAddr, inet_ntoa(pHost->sin_addr), 16);
 	} else {
 		printf("%s ****get ip addr error!\n", __FUNCTION__);
 		nRet = -1;
 	}
 
 	bzero(&tReq, sizeof (struct ifreq));
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	if (ioctl(nSock, SIOCGIFNETMASK, &tReq) >= 0) {
 		pHost = (struct sockaddr_in*) &tReq.ifr_addr;
-		strcpy(szNetmask, inet_ntoa(pHost->sin_addr));
+		strncpy(pNetmask, inet_ntoa(pHost->sin_addr), 16);
 	} else {
 		printf("%s ****get netmask error!\n", __FUNCTION__);
 		nRet = -1;
 	}
 	bzero(&tReq, sizeof (struct ifreq));
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	if (ioctl(nSock, SIOCGIFHWADDR, &tReq) >= 0) {
-		sprintf(szMacAddr, "%02x:%02x:%02x:%02x:%02x:%02x",
+		sprintf(pMacAddr, "%02x:%02x:%02x:%02x:%02x:%02x",
 		(unsigned char) tReq.ifr_hwaddr.sa_data[0],
 		(unsigned char) tReq.ifr_hwaddr.sa_data[1],
 		(unsigned char) tReq.ifr_hwaddr.sa_data[2],
@@ -209,9 +407,9 @@ NL_GetLocalNetInfo(const char* lpszEth, char* szIpAddr, char* szNetmask, char* s
 	return nRet;
 }
 /*!
- * @brief set ip address and subnet mask
+ * @brief set ip address and subnet mask by lpNetDev
  */
-int NL_SetLocalNetInfo(const char* lpszEth, const char* lpszIpAddr, const char* lpszNetmask)
+int NL_SetLocalNetInfo(const char* lpNetDev, const char* lpIpAddr, const char* lpNetmask)
 {
 	int nRet = -1;
 	struct ifreq tReq;
@@ -222,30 +420,32 @@ int NL_SetLocalNetInfo(const char* lpszEth, const char* lpszIpAddr, const char* 
 		goto END;
 	}
 	bzero(&tReq, sizeof (struct ifreq));
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	pHost = (struct sockaddr_in*) &tReq.ifr_addr;
 	pHost->sin_family = AF_INET;
 	// inet_pton returns 1 on success
-	if (1 != inet_pton(AF_INET, lpszIpAddr, &(pHost->sin_addr))) {
+	if (1 != inet_pton(AF_INET, lpIpAddr, &(pHost->sin_addr))) {
 		printf("%s ****inet_pton ip addr error!\n", __FUNCTION__);
 		goto END;
 	}
 	// set ip addr
 	if (ioctl(nSock, SIOCSIFADDR, &tReq) < 0) {
-		printf("%s ****ioctl SIOCSIFADDR error!\n", __FUNCTION__);
+        printf("%s ****ioctl SIOCSIFADDR error!\n", __FUNCTION__);
+        printf("%s ****net dev: %s, ip addr: %s\n", __FUNCTION__, lpNetDev, lpIpAddr);
 		goto END;
 	}
 	bzero(&tReq, sizeof (struct ifreq));
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	pHost = (struct sockaddr_in*) &tReq.ifr_addr;
 	pHost->sin_family = AF_INET;
-	if (1 != inet_pton(AF_INET, lpszNetmask, &(pHost->sin_addr))) {
+	if (1 != inet_pton(AF_INET, lpNetmask, &(pHost->sin_addr))) {
 		printf("%s ****inet_pton net mask error!\n", __FUNCTION__);
 		goto END;
 	}
 	// set net mask
 	if (ioctl(nSock, SIOCSIFNETMASK, &tReq) < 0) {
 		printf("%s ****ioctl SIOCSIFNETMASK error!\n", __FUNCTION__);
+        printf("%s ****net dev: %s, net mask: %s\n", __FUNCTION__, lpNetDev, lpNetmask);
 		goto END;
 	}
 	nRet = 0;
@@ -259,10 +459,10 @@ END:
 }
 
 /*!
- * @brief set netcard mtu
+ * @brief set mtu by lpNetDev
  */
 int
-NL_SetMtu(const char* lpszEth, unsigned int nMtu)
+NL_SetMtu(const char* lpNetDev, unsigned int nMtu)
 {
 	int nRet = -1;
 	struct ifreq tReq;
@@ -271,7 +471,7 @@ NL_SetMtu(const char* lpszEth, unsigned int nMtu)
 		printf("%s ****socket error!\n", __FUNCTION__);
 		goto END;
 	}
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	tReq.ifr_ifru.ifru_mtu = nMtu;
 	// set mtu
 	if (ioctl(nSock, SIOCSIFMTU, &tReq) < 0) {
@@ -292,7 +492,7 @@ END:
  * @brief set netcard down
  */
 int
-NL_SetIfDown(const char* lpszEth)
+NL_SetIfDown(const char* lpNetDev)
 {
 	int nRet = -1;
 	struct ifreq tReq;
@@ -301,7 +501,7 @@ NL_SetIfDown(const char* lpszEth)
 		printf("%s ****socket error!\n", __FUNCTION__);
 		goto END;
 	}
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, lpNetDev, IFNAMSIZ);
 	// get flag
 	if (ioctl(nSock, SIOCGIFFLAGS, &tReq) < 0) {
 		printf("%s ****ioctl SIOCGIFFLAGS error!\n", __FUNCTION__);
@@ -327,7 +527,7 @@ END:
  * @brief set netcard up
  */
 int
-NL_SetIfUp(const char* lpszEth)
+NL_SetIfUp(const char* pNetDev)
 {
 	int nRet = -1;
 	struct ifreq tReq;
@@ -336,7 +536,7 @@ NL_SetIfUp(const char* lpszEth)
 		printf("%s ****socket error!\n", __FUNCTION__);
 		goto END;
 	}
-	strcpy(tReq.ifr_name, lpszEth);
+	strncpy(tReq.ifr_name, pNetDev, IFNAMSIZ);
 	// get flag
 	if (ioctl(nSock, SIOCGIFFLAGS, &tReq) < 0) {
 		printf("%s ****ioctl SIOCGIFFLAGS error!\n", __FUNCTION__);
@@ -358,6 +558,7 @@ END:
 	return nRet;
 }
 
+#ifdef NETCARD_NET_UNITEST
 int main(int argc, char* argv[])
 {
 	if (argc < 2) {
@@ -374,8 +575,6 @@ int main(int argc, char* argv[])
 	printf("set local net info!\n");
 	NL_GetLocalNetInfo("eth0", szIpAddr, szNetmask, szMacAddr);
 	printf("ipaddr: %s\nnetmask: %s\nhwaddr: %s\n", szIpAddr, szNetmask, szMacAddr);
-	char szDlfGw[32] = "";
-	NL_GetDefaultGateway("eth0", szDlfGw);
-	printf("default gateway: %s\n", szDlfGw);
 	return 0;
 }
+#endif
